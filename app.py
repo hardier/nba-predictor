@@ -120,9 +120,6 @@ else:
 st.header("1. 🔮 Live Predictions (Tonight)")
 
 conn = sqlite3.connect(nba_db.DB_NAME) if hasattr(nba_db, 'DB_NAME') else None
-# Note: Since we switched to hybrid nba_db, we should use its helper if available,
-# but for the 'snapshots' table, direct SQL via nba_db engine is better.
-# We will use the helper method defined in nba_db.py called 'get_latest_snapshot'
 try:
     df_latest = nba_db.get_latest_snapshot()
     
@@ -146,7 +143,7 @@ try:
         df_latest['Prob_Rise'] = p_rise * 100
         df_latest['Prob_Fall'] = p_fall * 100
         
-        # --- HIGHLIGHTING LOGIC (>= 60%) ---
+        # Highlight Hot Players
         def add_hot_icon(row, col_name):
             if row[col_name] >= 60:
                 return f"🔥 {row['web_name']}"
@@ -158,7 +155,7 @@ try:
         # Configs
         prog_config = st.column_config.ProgressColumn("Confidence", format="%.1f%%", min_value=0, max_value=100)
         curr_config = st.column_config.NumberColumn("Price", format="$%.1f")
-        net_config = st.column_config.NumberColumn("Net Transfers", format="%d") # New Config
+        net_config = st.column_config.NumberColumn("Net Transfers", format="%d")
         
         col1, col2 = st.columns(2)
         
@@ -220,10 +217,12 @@ if not df_train.empty:
     day_df['Team'] = day_df['player_id'].map(lambda x: meta_map.get(x, {}).get('team', 'UNK'))
     day_df['Pos'] = day_df['player_id'].map(lambda x: meta_map.get(x, {}).get('pos', 'UNK'))
     
-    # --- A. HITS (Threshold updated to 60%) ---
+    # Configs for History
+    net_config_hist = st.column_config.NumberColumn("Net Transfers", format="%d")
+    
+    # --- A. HITS ---
     st.subheader("A. Correct Predictions (Hits >= 60%)")
     def get_hit_marker(row):
-        # CHANGED: Threshold > 60 (Strict Mode)
         if row['AI_Rise'] >= 60 and row['actual_change_val'] > 0: return "✅ HIT (+0.1)"
         if row['AI_Fall'] >= 60 and row['actual_change_val'] < 0: return "✅ HIT (-0.1)"
         return None
@@ -235,16 +234,18 @@ if not df_train.empty:
     
     if not hits.empty:
         st.dataframe(
-            hits[['Name', 'Team', 'Pos', 'Hit_Status', 'Confidence']],
-            column_config={"Confidence": prog_config},
+            hits[['Name', 'Team', 'Pos', 'net_transfers', 'Hit_Status', 'Confidence']],
+            column_config={
+                "net_transfers": net_config_hist,
+                "Confidence": prog_config
+            },
             hide_index=True, use_container_width=True
         )
     else:
         st.info("No correct high-confidence (>=60%) predictions.")
 
-    # --- B. MISSED (Missed because Confidence < 60%) ---
+    # --- B. MISSED ---
     st.subheader("B. ⚠️ Missed by AI (Underconfident)")
-    # Logic: Moved ACTUALLY, but AI confidence was < 60 (so it didn't count as a hit)
     missed = day_df[
         (day_df['actual_change_val'] != 0) & 
         (day_df['Hit_Status'].isnull())
@@ -256,8 +257,11 @@ if not df_train.empty:
         missed = missed.sort_values(by='AI_Predicted_Chance', ascending=False).head(10)
         
         st.dataframe(
-            missed[['Name', 'Team', 'Pos', 'Actual Move', 'AI_Predicted_Chance']],
-            column_config={"AI_Predicted_Chance": prog_config},
+            missed[['Name', 'Team', 'Pos', 'net_transfers', 'Actual Move', 'AI_Predicted_Chance']],
+            column_config={
+                "net_transfers": net_config_hist,
+                "AI_Predicted_Chance": prog_config
+            },
             hide_index=True, use_container_width=True
         )
     else:
@@ -267,7 +271,7 @@ if not df_train.empty:
     st.subheader("C. ⚠️ False Alarms")
     false_alarms = day_df[
         (day_df['actual_change_val'] == 0) & 
-        ((day_df['AI_Rise'] >= 60) | (day_df['AI_Fall'] >= 60)) # Updated threshold to 60 for fairness
+        ((day_df['AI_Rise'] >= 60) | (day_df['AI_Fall'] >= 60))
     ].copy()
     
     if not false_alarms.empty:
@@ -276,8 +280,11 @@ if not df_train.empty:
         false_alarms = false_alarms.sort_values(by='Confidence', ascending=False).head(10)
         
         st.dataframe(
-            false_alarms[['Name', 'Team', 'Pos', 'Predicted', 'Confidence']],
-            column_config={"Confidence": prog_config},
+            false_alarms[['Name', 'Team', 'Pos', 'net_transfers', 'Predicted', 'Confidence']],
+            column_config={
+                "net_transfers": net_config_hist,
+                "Confidence": prog_config
+            },
             hide_index=True, use_container_width=True
         )
     else:
