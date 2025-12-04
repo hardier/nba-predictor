@@ -1,13 +1,13 @@
 import streamlit as st
 import pandas as pd
-import nba_db  # Handles Cloud/Local DB connection
+import nba_db
 from sklearn.ensemble import RandomForestClassifier
 import numpy as np
 import requests
 import os
 
 # ==========================================
-# 1. CONFIGURATION & METADATA
+# 1. CONFIGURATION
 # ==========================================
 LEGACY_CSV = "nba_history_cache_v9.csv" 
 BASE_URL = "https://nbafantasy.nba.com/api"
@@ -87,8 +87,6 @@ def train_model(history_df):
 
 def get_probabilities(model, df_features):
     if model is None: return np.zeros(len(df_features)), np.zeros(len(df_features))
-    
-    # Fill NaN with 0 to prevent errors
     df_features = df_features.fillna(0)
     
     probs = model.predict_proba(df_features)
@@ -102,20 +100,11 @@ def get_probabilities(model, df_features):
     p_rise = probs[:, idx_rise] if idx_rise is not None else np.zeros(len(df_features))
     p_fall = probs[:, idx_fall] if idx_fall is not None else np.zeros(len(df_features))
     
-    # --- GLOBAL SANITY CHECK ---
-    # Enforce basic economic rules on the PREDICTIONS
-    # Rise = 0 if Net Transfers <= 0
-    # Fall = 0 if Net Transfers >= 0
-    
-    # We must ensure 'net_transfers' column is available for this check
+    # --- SANITY FILTER ---
+    # Enforce basic rules using Net Transfers
     if 'net_transfers' in df_features.columns:
-        # Create boolean masks
-        mask_no_rise = df_features['net_transfers'] <= 0
-        mask_no_fall = df_features['net_transfers'] >= 0
-        
-        # Apply masks (Vectorized)
-        p_rise = np.where(mask_no_rise, 0.0, p_rise)
-        p_fall = np.where(mask_no_fall, 0.0, p_fall)
+        p_rise = np.where(df_features['net_transfers'] <= 0, 0.0, p_rise)
+        p_fall = np.where(df_features['net_transfers'] >= 0, 0.0, p_fall)
         
     return p_rise, p_fall
 
@@ -151,43 +140,50 @@ try:
         df_latest['points'] = 15
         df_latest['minutes'] = 30
         
-        # Ensure Net Transfers is Int (Fixes display 0.0)
-        df_latest['net_transfers'] = df_latest['net_transfers'].fillna(0).astype(int)
-        
+        # Metadata Map
         df_latest['Team'] = df_latest['player_id'].map(lambda x: meta_map.get(x, {}).get('team', 'UNK'))
-        df_latest['Pos'] = df_latest['player_id'].map(lambda x: meta_map.get(x, {}).get('pos', 'UNK'))
+        
+        # 2. Check for new Schema Columns (In/Out)
+        # If database is old, these columns might be missing. Fill with 0 if so.
+        if 'transfers_in_event' not in df_latest.columns:
+            df_latest['transfers_in_event'] = 0
+        if 'transfers_out_event' not in df_latest.columns:
+            df_latest['transfers_out_event'] = 0
 
-        # 2. Predict (With Sanity Check built-in)
+        # Ensure Net is Int
+        df_latest['net_transfers'] = df_latest['net_transfers'].fillna(0).astype(int)
+
+        # 3. Predict
         feats = ['net_transfers', 'selected', 'points', 'minutes', 'value_start']
         p_rise, p_fall = get_probabilities(model, df_latest[feats])
         
         df_latest['Prob_Rise'] = p_rise * 100
         df_latest['Prob_Fall'] = p_fall * 100
 
-        # 3. Highlight Hot Players
+        # 4. Highlight Hot Players (>= 60%)
         def add_hot_icon(row, col_name):
-            if row[col_name] >= 60:
-                return f"🔥 {row['web_name']}"
-            return row['web_name']
+            return f"🔥 {row['web_name']}" if row[col_name] >= 60 else row['web_name']
 
-        df_latest['Display_Name_Rise'] = df_latest.apply(lambda r: add_hot_icon(r, 'Prob_Rise'), axis=1)
-        df_latest['Display_Name_Fall'] = df_latest.apply(lambda r: add_hot_icon(r, 'Prob_Fall'), axis=1)
+        df_latest['Display_Rise'] = df_latest.apply(lambda r: add_hot_icon(r, 'Prob_Rise'), axis=1)
+        df_latest['Display_Fall'] = df_latest.apply(lambda r: add_hot_icon(r, 'Prob_Fall'), axis=1)
 
-        # 4. Display
+        # 5. Display Tables
         prog_config = st.column_config.ProgressColumn("Confidence", format="%.1f%%", min_value=0, max_value=100)
         curr_config = st.column_config.NumberColumn("Price", format="$%.1f")
-        net_config = st.column_config.NumberColumn("Net Transfers", format="%d")
+        num_config = st.column_config.NumberColumn(format="%d") # For plain integers
         
         col1, col2 = st.columns(2)
         
         with col1:
             st.subheader("🚀 Predicted Risers")
             risers = df_latest[df_latest['Prob_Rise'] > 10].sort_values(by='Prob_Rise', ascending=False).head(10)
+            
             st.dataframe(
-                risers[['Display_Name_Rise', 'Team', 'net_transfers', 'value_start', 'Prob_Rise']],
+                risers[['Display_Rise', 'Team', 'transfers_in_event', 'net_transfers', 'value_start', 'Prob_Rise']],
                 column_config={
-                    "Display_Name_Rise": "Player",
-                    "net_transfers": net_config,
+                    "Display_Rise": "Player",
+                    "transfers_in_event": st.column_config.NumberColumn("In (Event)", format="%d"),
+                    "net_transfers": st.column_config.NumberColumn("Net", format="%d"),
                     "value_start": curr_config, 
                     "Prob_Rise": prog_config
                 },
@@ -197,11 +193,13 @@ try:
         with col2:
             st.subheader("📉 Predicted Fallers")
             fallers = df_latest[df_latest['Prob_Fall'] > 10].sort_values(by='Prob_Fall', ascending=False).head(10)
+            
             st.dataframe(
-                fallers[['Display_Name_Fall', 'Team', 'net_transfers', 'value_start', 'Prob_Fall']],
+                fallers[['Display_Fall', 'Team', 'transfers_out_event', 'net_transfers', 'value_start', 'Prob_Fall']],
                 column_config={
-                    "Display_Name_Fall": "Player",
-                    "net_transfers": net_config,
+                    "Display_Fall": "Player",
+                    "transfers_out_event": st.column_config.NumberColumn("Out (Event)", format="%d"),
+                    "net_transfers": st.column_config.NumberColumn("Net", format="%d"),
                     "value_start": curr_config, 
                     "Prob_Fall": prog_config
                 },
@@ -229,7 +227,6 @@ if not df_train.empty:
     for f in feats: 
         if f not in day_df.columns: day_df[f] = 0
             
-    # Ensure net_transfers is clean
     day_df['net_transfers'] = day_df['net_transfers'].fillna(0).astype(int)
 
     p_rise, p_fall = get_probabilities(model, day_df[feats])
@@ -238,9 +235,6 @@ if not df_train.empty:
     
     day_df['Name'] = day_df['player_id'].map(lambda x: meta_map.get(x, {}).get('name', f"ID {x}"))
     day_df['Team'] = day_df['player_id'].map(lambda x: meta_map.get(x, {}).get('team', 'UNK'))
-    day_df['Pos'] = day_df['player_id'].map(lambda x: meta_map.get(x, {}).get('pos', 'UNK'))
-    
-    net_config_hist = st.column_config.NumberColumn("Net Transfers", format="%d")
     
     # A. HITS
     st.subheader("A. Correct Predictions (Hits >= 60%)")
@@ -256,8 +250,8 @@ if not df_train.empty:
     
     if not hits.empty:
         st.dataframe(
-            hits[['Name', 'Team', 'Pos', 'net_transfers', 'Hit_Status', 'Confidence']],
-            column_config={"net_transfers": net_config_hist, "Confidence": prog_config},
+            hits[['Name', 'Team', 'net_transfers', 'Hit_Status', 'Confidence']],
+            column_config={"net_transfers": num_config, "Confidence": prog_config},
             hide_index=True, use_container_width=True
         )
     else:
@@ -273,8 +267,8 @@ if not df_train.empty:
         missed = missed.sort_values(by='AI_Predicted_Chance', ascending=False).head(10)
         
         st.dataframe(
-            missed[['Name', 'Team', 'Pos', 'net_transfers', 'Actual Move', 'AI_Predicted_Chance']],
-            column_config={"net_transfers": net_config_hist, "AI_Predicted_Chance": prog_config},
+            missed[['Name', 'Team', 'net_transfers', 'Actual Move', 'AI_Predicted_Chance']],
+            column_config={"net_transfers": num_config, "AI_Predicted_Chance": prog_config},
             hide_index=True, use_container_width=True
         )
     else:
@@ -293,8 +287,8 @@ if not df_train.empty:
         false_alarms = false_alarms.sort_values(by='Confidence', ascending=False).head(10)
         
         st.dataframe(
-            false_alarms[['Name', 'Team', 'Pos', 'net_transfers', 'Predicted', 'Confidence']],
-            column_config={"net_transfers": net_config_hist, "Confidence": prog_config},
+            false_alarms[['Name', 'Team', 'net_transfers', 'Predicted', 'Confidence']],
+            column_config={"net_transfers": num_config, "Confidence": prog_config},
             hide_index=True, use_container_width=True
         )
     else:
