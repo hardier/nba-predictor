@@ -87,6 +87,10 @@ def train_model(history_df):
 
 def get_probabilities(model, df_features):
     if model is None: return np.zeros(len(df_features)), np.zeros(len(df_features))
+    
+    # Fill NaN with 0 to prevent errors
+    df_features = df_features.fillna(0)
+    
     probs = model.predict_proba(df_features)
     classes = model.classes_
     
@@ -97,6 +101,22 @@ def get_probabilities(model, df_features):
     
     p_rise = probs[:, idx_rise] if idx_rise is not None else np.zeros(len(df_features))
     p_fall = probs[:, idx_fall] if idx_fall is not None else np.zeros(len(df_features))
+    
+    # --- GLOBAL SANITY CHECK ---
+    # Enforce basic economic rules on the PREDICTIONS
+    # Rise = 0 if Net Transfers <= 0
+    # Fall = 0 if Net Transfers >= 0
+    
+    # We must ensure 'net_transfers' column is available for this check
+    if 'net_transfers' in df_features.columns:
+        # Create boolean masks
+        mask_no_rise = df_features['net_transfers'] <= 0
+        mask_no_fall = df_features['net_transfers'] >= 0
+        
+        # Apply masks (Vectorized)
+        p_rise = np.where(mask_no_rise, 0.0, p_rise)
+        p_fall = np.where(mask_no_fall, 0.0, p_fall)
+        
     return p_rise, p_fall
 
 # ==========================================
@@ -119,7 +139,6 @@ else:
 # ---------------------------------------------------------
 st.header("1. 🔮 Live Predictions (Tonight)")
 
-conn = sqlite3.connect(nba_db.DB_NAME) if hasattr(nba_db, 'DB_NAME') else None
 try:
     df_latest = nba_db.get_latest_snapshot()
     
@@ -127,23 +146,25 @@ try:
         last_time = df_latest.iloc[0]['timestamp']
         st.caption(f"Snapshot Time: {last_time}")
         
-        # Mapping & Fixing
+        # 1. Prepare Data
         df_latest['value_start'] = df_latest['now_cost'] / 10.0
         df_latest['points'] = 15
         df_latest['minutes'] = 30
         
-        # Map Metadata
+        # Ensure Net Transfers is Int (Fixes display 0.0)
+        df_latest['net_transfers'] = df_latest['net_transfers'].fillna(0).astype(int)
+        
         df_latest['Team'] = df_latest['player_id'].map(lambda x: meta_map.get(x, {}).get('team', 'UNK'))
         df_latest['Pos'] = df_latest['player_id'].map(lambda x: meta_map.get(x, {}).get('pos', 'UNK'))
 
-        # Predict
+        # 2. Predict (With Sanity Check built-in)
         feats = ['net_transfers', 'selected', 'points', 'minutes', 'value_start']
         p_rise, p_fall = get_probabilities(model, df_latest[feats])
         
         df_latest['Prob_Rise'] = p_rise * 100
         df_latest['Prob_Fall'] = p_fall * 100
-        
-        # Highlight Hot Players
+
+        # 3. Highlight Hot Players
         def add_hot_icon(row, col_name):
             if row[col_name] >= 60:
                 return f"🔥 {row['web_name']}"
@@ -152,7 +173,7 @@ try:
         df_latest['Display_Name_Rise'] = df_latest.apply(lambda r: add_hot_icon(r, 'Prob_Rise'), axis=1)
         df_latest['Display_Name_Fall'] = df_latest.apply(lambda r: add_hot_icon(r, 'Prob_Fall'), axis=1)
 
-        # Configs
+        # 4. Display
         prog_config = st.column_config.ProgressColumn("Confidence", format="%.1f%%", min_value=0, max_value=100)
         curr_config = st.column_config.NumberColumn("Price", format="$%.1f")
         net_config = st.column_config.NumberColumn("Net Transfers", format="%d")
@@ -203,12 +224,14 @@ if not df_train.empty:
     dates = sorted(df_train['kickoff_time'].unique(), reverse=True)
     sel_date = st.selectbox("Select Past Date", dates)
     
-    # Filter & Predict
     day_df = df_train[df_train['kickoff_time'] == sel_date].copy()
     feats = ['net_transfers', 'selected', 'points', 'minutes', 'value_start']
     for f in feats: 
         if f not in day_df.columns: day_df[f] = 0
             
+    # Ensure net_transfers is clean
+    day_df['net_transfers'] = day_df['net_transfers'].fillna(0).astype(int)
+
     p_rise, p_fall = get_probabilities(model, day_df[feats])
     day_df['AI_Rise'] = p_rise * 100
     day_df['AI_Fall'] = p_fall * 100
@@ -217,10 +240,9 @@ if not df_train.empty:
     day_df['Team'] = day_df['player_id'].map(lambda x: meta_map.get(x, {}).get('team', 'UNK'))
     day_df['Pos'] = day_df['player_id'].map(lambda x: meta_map.get(x, {}).get('pos', 'UNK'))
     
-    # Configs for History
     net_config_hist = st.column_config.NumberColumn("Net Transfers", format="%d")
     
-    # --- A. HITS ---
+    # A. HITS
     st.subheader("A. Correct Predictions (Hits >= 60%)")
     def get_hit_marker(row):
         if row['AI_Rise'] >= 60 and row['actual_change_val'] > 0: return "✅ HIT (+0.1)"
@@ -235,21 +257,15 @@ if not df_train.empty:
     if not hits.empty:
         st.dataframe(
             hits[['Name', 'Team', 'Pos', 'net_transfers', 'Hit_Status', 'Confidence']],
-            column_config={
-                "net_transfers": net_config_hist,
-                "Confidence": prog_config
-            },
+            column_config={"net_transfers": net_config_hist, "Confidence": prog_config},
             hide_index=True, use_container_width=True
         )
     else:
         st.info("No correct high-confidence (>=60%) predictions.")
 
-    # --- B. MISSED ---
+    # B. MISSED
     st.subheader("B. ⚠️ Missed by AI (Underconfident)")
-    missed = day_df[
-        (day_df['actual_change_val'] != 0) & 
-        (day_df['Hit_Status'].isnull())
-    ].copy()
+    missed = day_df[(day_df['actual_change_val'] != 0) & (day_df['Hit_Status'].isnull())].copy()
     
     if not missed.empty:
         missed['AI_Predicted_Chance'] = np.where(missed['actual_change_val'] > 0, missed['AI_Rise'], missed['AI_Fall'])
@@ -258,16 +274,13 @@ if not df_train.empty:
         
         st.dataframe(
             missed[['Name', 'Team', 'Pos', 'net_transfers', 'Actual Move', 'AI_Predicted_Chance']],
-            column_config={
-                "net_transfers": net_config_hist,
-                "AI_Predicted_Chance": prog_config
-            },
+            column_config={"net_transfers": net_config_hist, "AI_Predicted_Chance": prog_config},
             hide_index=True, use_container_width=True
         )
     else:
-        st.success("AI caught all moves with high confidence!")
+        st.success("AI caught all moves!")
 
-    # --- C. FALSE ALARMS ---
+    # C. FALSE ALARMS
     st.subheader("C. ⚠️ False Alarms")
     false_alarms = day_df[
         (day_df['actual_change_val'] == 0) & 
@@ -281,10 +294,7 @@ if not df_train.empty:
         
         st.dataframe(
             false_alarms[['Name', 'Team', 'Pos', 'net_transfers', 'Predicted', 'Confidence']],
-            column_config={
-                "net_transfers": net_config_hist,
-                "Confidence": prog_config
-            },
+            column_config={"net_transfers": net_config_hist, "Confidence": prog_config},
             hide_index=True, use_container_width=True
         )
     else:
