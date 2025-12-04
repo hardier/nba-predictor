@@ -2,8 +2,12 @@ import sqlite3
 import pandas as pd
 from datetime import datetime
 import pytz
+import os
 
-DB_NAME = "nba_fantasy.db"
+# If running on Render, use the /data folder. If local, use current folder.
+# We will set the 'DB_PATH' environment variable in the Render Dashboard later.
+DB_FOLDER = os.getenv('DB_PATH', '.') 
+DB_NAME = os.path.join(DB_FOLDER, "nba_fantasy.db")
 
 def init_db():
     conn = sqlite3.connect(DB_NAME)
