@@ -1,7 +1,6 @@
 import streamlit as st
 import pandas as pd
-import sqlite3
-import nba_db  # Ensure nba_db.py is in the same folder
+import nba_db  # This now handles the Cloud Connection
 from sklearn.ensemble import RandomForestClassifier
 import numpy as np
 import requests
@@ -10,13 +9,13 @@ import os
 # ==========================================
 # 1. CONFIGURATION & METADATA
 # ==========================================
+# We use the legacy CSV only for historical training if available
 LEGACY_CSV = "nba_history_cache_v9.csv" 
 BASE_URL = "https://nbafantasy.nba.com/api"
-POSITION_MAP = {1: 'BC', 2: 'FC', 3: 'FC'} # Backcourt / Frontcourt
+POSITION_MAP = {1: 'BC', 2: 'FC', 3: 'FC'} 
 
 st.set_page_config(layout="wide", page_title="NBA AI Hybrid Predictor")
 
-# Fetch Metadata (Teams/Positions) to map IDs later
 @st.cache_data(ttl=3600)
 def fetch_metadata():
     try:
@@ -41,16 +40,18 @@ meta_map = fetch_metadata()
 def load_hybrid_training_data():
     data_frames = []
     
-    # A. Legacy CSV
+    # A. Legacy CSV (Backup)
     if os.path.exists(LEGACY_CSV):
         try:
             df_legacy = pd.read_csv(LEGACY_CSV)
             data_frames.append(df_legacy)
         except: pass
 
-    # B. Live DB
+    # B. Live Cloud DB (PostgreSQL)
     try:
+        # We use the helper function from nba_db instead of direct SQL
         df_new = nba_db.get_training_data()
+        
         if not df_new.empty:
             df_new = df_new.rename(columns={
                 'final_net_transfers': 'net_transfers', 
@@ -62,7 +63,9 @@ def load_hybrid_training_data():
             if 'minutes' not in df_new.columns: df_new['minutes'] = 30
             df_new['target_class'] = df_new['target_class'].astype(int)
             data_frames.append(df_new)
-    except: pass
+    except Exception as e:
+        print(f"DB Load Error: {e}")
+        pass
         
     if not data_frames: return pd.DataFrame()
     return pd.concat(data_frames, ignore_index=True)
@@ -104,7 +107,7 @@ def get_probabilities(model, df_features):
 # ==========================================
 # 4. MAIN APP UI
 # ==========================================
-st.title("🏀 NBA Fantasy AI (Hybrid System)")
+st.title("🏀 NBA Fantasy AI (Cloud Hybrid)")
 
 with st.spinner("Loading hybrid data..."):
     df_train = load_hybrid_training_data()
@@ -113,7 +116,7 @@ if not df_train.empty:
     model = train_model(df_train)
     st.sidebar.success(f"🧠 AI Trained on {len(df_train)} events.")
 else:
-    st.error("No training data found. Run 'initialize_history.py'.")
+    st.error("No training data found. (History file missing or DB empty).")
     st.stop()
 
 # ---------------------------------------------------------
@@ -121,21 +124,21 @@ else:
 # ---------------------------------------------------------
 st.header("1. 🔮 Live Predictions (Tonight)")
 
-conn = sqlite3.connect(nba_db.DB_NAME)
+# >>> FIX: Use nba_db helper instead of sqlite3 <<<
 try:
-    last_time = pd.read_sql("SELECT MAX(timestamp) FROM snapshots", conn).iloc[0, 0]
+    df_latest = nba_db.get_latest_snapshot()
     
-    if last_time:
+    if not df_latest.empty:
+        # Extract timestamp from the first row
+        last_time = df_latest.iloc[0]['timestamp']
         st.caption(f"Snapshot Time: {last_time}")
-        df_latest = pd.read_sql("SELECT * FROM snapshots WHERE timestamp = ?", conn, params=(last_time,))
         
         # Mapping & Fixing
         df_latest['value_start'] = df_latest['now_cost'] / 10.0
         df_latest['points'] = 15
         df_latest['minutes'] = 30
         
-        # Map Metadata for Live View
-        # (Snapshot has web_name but we can enrich with Team/Pos if needed)
+        # Map Metadata
         df_latest['Team'] = df_latest['player_id'].map(lambda x: meta_map.get(x, {}).get('team', 'UNK'))
         df_latest['Pos'] = df_latest['player_id'].map(lambda x: meta_map.get(x, {}).get('pos', 'UNK'))
 
@@ -169,11 +172,10 @@ try:
                 hide_index=True, use_container_width=True
             )
     else:
-        st.info("Waiting for Scheduler...")
+        st.info("Waiting for Scheduler... (No snapshots in Cloud DB yet)")
+
 except Exception as e:
-    st.error(f"DB Error: {e}")
-finally:
-    conn.close()
+    st.error(f"Error fetching snapshot: {e}")
 
 st.divider()
 
@@ -197,12 +199,12 @@ if not df_train.empty:
     day_df['AI_Rise'] = p_rise * 100
     day_df['AI_Fall'] = p_fall * 100
     
-    # --- MAPPING METADATA ---
+    # Mapping Metadata
     day_df['Name'] = day_df['player_id'].map(lambda x: meta_map.get(x, {}).get('name', f"ID {x}"))
     day_df['Team'] = day_df['player_id'].map(lambda x: meta_map.get(x, {}).get('team', 'UNK'))
     day_df['Pos'] = day_df['player_id'].map(lambda x: meta_map.get(x, {}).get('pos', 'UNK'))
     
-    # --- A. HITS ---
+    # A. HITS
     st.subheader("A. Correct Predictions (Hits)")
     def get_hit_marker(row):
         if row['AI_Rise'] > 40 and row['actual_change_val'] > 0: return "✅ HIT (+0.1)"
@@ -211,8 +213,6 @@ if not df_train.empty:
 
     day_df['Hit_Status'] = day_df.apply(get_hit_marker, axis=1)
     hits = day_df[day_df['Hit_Status'].notnull()].copy()
-    
-    # Calculate single Confidence column for sorting
     hits['Confidence'] = np.where(hits['actual_change_val'] > 0, hits['AI_Rise'], hits['AI_Fall'])
     hits = hits.sort_values(by='Confidence', ascending=False).head(10)
     
@@ -225,15 +225,13 @@ if not df_train.empty:
     else:
         st.info("No correct high-confidence predictions.")
 
-    # --- B. MISSED ---
+    # B. MISSED
     st.subheader("B. ⚠️ Missed by AI")
     missed = day_df[(day_df['actual_change_val'] != 0) & (day_df['Hit_Status'].isnull())].copy()
     
     if not missed.empty:
         missed['AI_Predicted_Chance'] = np.where(missed['actual_change_val'] > 0, missed['AI_Rise'], missed['AI_Fall'])
         missed['Actual Move'] = np.where(missed['actual_change_val'] > 0, "📈 ROSE", "📉 FELL")
-        
-        # Sort by actual predicted chance (to see near-misses first)
         missed = missed.sort_values(by='AI_Predicted_Chance', ascending=False).head(10)
         
         st.dataframe(
@@ -244,7 +242,7 @@ if not df_train.empty:
     else:
         st.success("AI caught all moves!")
 
-    # --- C. FALSE ALARMS ---
+    # C. FALSE ALARMS
     st.subheader("C. ⚠️ False Alarms")
     false_alarms = day_df[
         (day_df['actual_change_val'] == 0) & 
@@ -254,8 +252,6 @@ if not df_train.empty:
     if not false_alarms.empty:
         false_alarms['Predicted'] = np.where(false_alarms['AI_Rise'] > false_alarms['AI_Fall'], "📈 Rise", "📉 Fall")
         false_alarms['Confidence'] = np.where(false_alarms['AI_Rise'] > false_alarms['AI_Fall'], false_alarms['AI_Rise'], false_alarms['AI_Fall'])
-        
-        # Sort by Confidence Descending
         false_alarms = false_alarms.sort_values(by='Confidence', ascending=False).head(10)
         
         st.dataframe(
