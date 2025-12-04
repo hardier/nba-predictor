@@ -5,3 +5,5 @@ schedule
 pytz
 scikit-learn
 numpy
+psycopg2-binary
+sqlalchemy

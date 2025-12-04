@@ -51,15 +51,12 @@ def job_post_deadline_check():
     print("🔓 Checking Post-Deadline Changes...")
     
     if not pre_deadline_state:
-        print("⚠️ No pre-deadline state found. Skipping comparison.")
+        print("⚠️ No pre-deadline state found. Skipping.")
         return
 
     df_now = fetch_api()
     if df_now.empty: return
 
-    conn = nba_db.sqlite3.connect(nba_db.DB_NAME)
-    c = conn.cursor()
-    
     pst = pytz.timezone('US/Pacific')
     today_str = datetime.now(pst).strftime('%Y-%m-%d')
     
@@ -74,32 +71,23 @@ def job_post_deadline_check():
             end_price = row['now_cost']
             price_change = end_price - start_price
             
-            # Target Class: 1 (Rise), -1 (Fall), 0 (Same)
+            # 1 (Rise), -1 (Fall), 0 (Same)
             if price_change > 0: target = 1
             elif price_change < 0: target = -1
             else: target = 0
             
-            # Only save if we have valid transfer data
             try: sel = float(old_data['selected']) * 1000
             except: sel = 0
             
+            # Add to list
             events.append((
-                today_str,
-                pid,
-                start_price,
-                end_price,
-                price_change,
-                old_data['transfers'], # Use the transfers known BEFORE the change
-                sel,
-                target
+                today_str, pid, start_price, end_price, price_change,
+                old_data['transfers'], sel, target
             ))
 
-    c.executemany('INSERT INTO daily_events VALUES (?,?,?,?,?,?,?,?)', events)
-    conn.commit()
-    conn.close()
-    print(f"✅ Daily processing complete. {len(events)} records saved.")
+    # USE THE NEW DB FUNCTION
+    nba_db.save_daily_events(events)
     
-    # Clear memory
     pre_deadline_state = {}
 
 # --- SCHEDULING ---
